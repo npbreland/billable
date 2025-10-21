@@ -17,11 +17,8 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS periods
                  (id INTEGER PRIMARY KEY, client_id INTEGER, 
                   start_time TEXT, end_time TEXT,
+                  total_seconds INTEGER DEFAULT 0,
                   FOREIGN KEY(client_id) REFERENCES clients(id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions
-                 (id INTEGER PRIMARY KEY, period_id INTEGER,
-                  start_time TEXT, end_time TEXT,
-                  FOREIGN KEY(period_id) REFERENCES periods(id))''')
     conn.commit()
     conn.close()
 
@@ -81,86 +78,6 @@ def start_period(client_name):
     print(f"✓ Started billing period for '{client_name}'")
     conn.close()
 
-def toggle_session_internal(client_name):
-    """Internal function to toggle session state"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
-    client = c.fetchone()
-    
-    if not client:
-        conn.close()
-        return None
-    
-    client_id = client[0]
-    
-    # Get active period
-    c.execute("""SELECT id FROM periods 
-                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
-    period = c.fetchone()
-    
-    if not period:
-        conn.close()
-        return None
-    
-    period_id = period[0]
-    
-    # Check for active session
-    c.execute("""SELECT id FROM sessions 
-                 WHERE period_id = ? AND end_time IS NULL""", (period_id,))
-    active_session = c.fetchone()
-    
-    now = datetime.now().isoformat()
-    
-    if active_session:
-        # Pause - end the current session
-        c.execute("UPDATE sessions SET end_time = ? WHERE id = ?", 
-                  (now, active_session[0]))
-        conn.commit()
-        conn.close()
-        return "paused"
-    else:
-        # Start - create new session
-        c.execute("INSERT INTO sessions (period_id, start_time) VALUES (?, ?)", 
-                  (period_id, now))
-        conn.commit()
-        conn.close()
-        return "running"
-
-def get_session_state(client_name):
-    """Check if timer is currently running"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
-    client = c.fetchone()
-    
-    if not client:
-        conn.close()
-        return None
-    
-    client_id = client[0]
-    
-    # Get active period
-    c.execute("""SELECT id FROM periods 
-                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
-    period = c.fetchone()
-    
-    if not period:
-        conn.close()
-        return None
-    
-    period_id = period[0]
-    
-    # Check for active session
-    c.execute("""SELECT id FROM sessions 
-                 WHERE period_id = ? AND end_time IS NULL""", (period_id,))
-    active_session = c.fetchone()
-    conn.close()
-    
-    return "running" if active_session else "paused"
-
 def getch():
     """Get a single character from stdin"""
     fd = sys.stdin.fileno()
@@ -195,7 +112,7 @@ def get_period_total_hours(client_name):
     client_id = client[0]
     
     # Get active period
-    c.execute("""SELECT id FROM periods 
+    c.execute("""SELECT total_seconds FROM periods 
                  WHERE client_id = ? AND end_time IS NULL""", (client_id,))
     period = c.fetchone()
     
@@ -203,55 +120,12 @@ def get_period_total_hours(client_name):
         conn.close()
         return 0
     
-    period_id = period[0]
-    
-    # Calculate hours from completed sessions
-    c.execute("""
-        SELECT start_time, end_time FROM sessions
-        WHERE period_id = ? AND end_time IS NOT NULL
-        ORDER BY start_time
-    """, (period_id,))
-    
-    sessions = c.fetchall()
-    total_hours = sum(calculate_hours(s[0], s[1]) for s in sessions)
-    
-    # Add current running session if any
-    c.execute("""
-        SELECT start_time FROM sessions
-        WHERE period_id = ? AND end_time IS NULL
-    """, (period_id,))
-    
-    running_session = c.fetchone()
-    if running_session:
-        total_hours += calculate_hours(running_session[0], datetime.now().isoformat())
+    total_hours = period[0] / 3600
     
     conn.close()
     return total_hours
 
-def display_status(client_name):
-    """Display the timer UI"""
-    state = get_session_state(client_name)
-    total_hours = get_period_total_hours(client_name)
-    
-    # Clear screen and show header
-    print("\033[2J\033[H")  # Clear screen and move cursor to top
-    print("="*60)
-    print(f"  Billable Timer: {client_name}")
-    print("="*60)
-    print("\n  Controls:")
-    print("    [ENTER]  - Play/Pause timer")
-    print("    [CTRL+D] - End session and exit")
-    print("\n" + "-"*60 + "\n")
-    
-    if state == "running":
-        print("  Status: ▶  RUNNING")
-    else:
-        print("  Status: ⏸  PAUSED")
-    
-    print(f"\n  Total Time: {format_time(total_hours)}")
-    
-    print("\n" + "-"*60)
-    print("\nPress ENTER to play/pause...")
+# display_status function removed - now handled within toggle_session
 
 def toggle_session(client_name):
     """Interactive toggle mode - press enter to toggle, Ctrl+D to exit"""
@@ -279,7 +153,12 @@ def toggle_session(client_name):
         conn.close()
         return
     
+    period_id = period[0]
     conn.close()
+    
+    # Local session state for this interactive session
+    session_running = False
+    session_start_time = None
     
     # Set stdin to non-blocking for running state
     import fcntl
@@ -288,25 +167,64 @@ def toggle_session(client_name):
     fd = sys.stdin.fileno()
     old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
     
+    def display_session_status():
+        """Display the timer UI with local session state"""
+        total_hours = get_period_total_hours(client_name)
+        
+        # Add current session time if running
+        if session_running and session_start_time:
+            current_session_hours = (datetime.now() - session_start_time).total_seconds() / 3600
+            total_hours += current_session_hours
+        
+        # Clear screen and show header
+        print("\033[2J\033[H")  # Clear screen and move cursor to top
+        print("="*60)
+        print(f"  Billable Timer: {client_name}")
+        print("="*60)
+        print("\n  Controls:")
+        print("    [ENTER]  - Play/Pause timer")
+        print("    [CTRL+D] - End session and exit")
+        print("\n" + "-"*60 + "\n")
+        
+        if session_running:
+            print("  Status: ▶  RUNNING")
+        else:
+            print("  Status: ⏸  PAUSED")
+        
+        print(f"\n  Total Time: {format_time(total_hours)}")
+        
+        print("\n" + "-"*60)
+        print("\nPress ENTER to play/pause...")
+    
     # Initial display
-    display_status(client_name)
+    display_session_status()
     
     try:
         last_update = time.time()
         
         while True:
-            state = get_session_state(client_name)
-            
-            if state == "running":
+            if session_running:
                 # Non-blocking mode when running
                 fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
                 
                 try:
                     line = sys.stdin.readline()
                     if line:
-                        # Toggle on enter
-                        toggle_session_internal(client_name)
-                        display_status(client_name)
+                        # Pause - save accumulated time
+                        if session_start_time:
+                            session_duration_seconds = int((datetime.now() - session_start_time).total_seconds())
+                            # Add this session time to the period's total_seconds
+                            conn = sqlite3.connect(DB_PATH)
+                            c = conn.cursor()
+                            c.execute("""UPDATE periods SET total_seconds = 
+                                        COALESCE(total_seconds, 0) + ? 
+                                        WHERE id = ?""", (session_duration_seconds, period_id))
+                            conn.commit()
+                            conn.close()
+                        
+                        session_running = False
+                        session_start_time = None
+                        display_session_status()
                         last_update = time.time()
                 except IOError:
                     # No input available
@@ -315,7 +233,7 @@ def toggle_session(client_name):
                 # Update display every second
                 current_time = time.time()
                 if current_time - last_update >= 1:
-                    display_status(client_name)
+                    display_session_status()
                     last_update = current_time
                 
                 time.sleep(0.1)  # Small sleep to prevent busy waiting
@@ -327,18 +245,49 @@ def toggle_session(client_name):
                 try:
                     line = sys.stdin.readline()
                     if line:
-                        toggle_session_internal(client_name)
-                        display_status(client_name)
+                        # Start timer
+                        session_running = True
+                        session_start_time = datetime.now()
+                        display_session_status()
                         last_update = time.time()
                     else:
-                        # EOF (Ctrl+D)
+                        # EOF (Ctrl+D) - save any accumulated time and exit
+                        if session_running and session_start_time:
+                            session_duration_seconds = int((datetime.now() - session_start_time).total_seconds())
+                            conn = sqlite3.connect(DB_PATH)
+                            c = conn.cursor()
+                            c.execute("""UPDATE periods SET total_seconds = 
+                                        COALESCE(total_seconds, 0) + ? 
+                                        WHERE id = ?""", (session_duration_seconds, period_id))
+                            conn.commit()
+                            conn.close()
                         print("\n\n✓ Session ended\n")
                         break
                 except EOFError:
+                    # Save any running session before exit
+                    if session_running and session_start_time:
+                        session_duration_seconds = int((datetime.now() - session_start_time).total_seconds())
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        c.execute("""UPDATE periods SET total_seconds = 
+                                    COALESCE(total_seconds, 0) + ? 
+                                    WHERE id = ?""", (session_duration_seconds, period_id))
+                        conn.commit()
+                        conn.close()
                     print("\n\n✓ Session ended\n")
                     break
                 
     except KeyboardInterrupt:
+        # Save any running session before exit
+        if session_running and session_start_time:
+            session_duration_seconds = int((datetime.now() - session_start_time).total_seconds())
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("""UPDATE periods SET total_seconds = 
+                        COALESCE(total_seconds, 0) + ? 
+                        WHERE id = ?""", (session_duration_seconds, period_id))
+            conn.commit()
+            conn.close()
         print("\n\n✓ Session ended\n")
     finally:
         # Restore original flags
@@ -370,28 +319,19 @@ def end_period(client_name):
     
     period_id = period[0]
     
-    # End any active session
-    now = datetime.now().isoformat()
-    c.execute("""UPDATE sessions SET end_time = ? 
-                 WHERE period_id = ? AND end_time IS NULL""", (now, period_id))
-    
     # End the period
+    now = datetime.now().isoformat()
     c.execute("UPDATE periods SET end_time = ? WHERE id = ?", (now, period_id))
     conn.commit()
     print(f"✓ Ended billing period for '{client_name}'")
     conn.close()
-
-def calculate_hours(start, end):
-    start_dt = datetime.fromisoformat(start)
-    end_dt = datetime.fromisoformat(end)
-    return (end_dt - start_dt).total_seconds() / 3600
 
 def list_hours():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     c.execute("""
-        SELECT c.name, p.id, p.start_time, p.end_time
+        SELECT c.name, p.id, p.start_time, p.end_time, p.total_seconds
         FROM clients c
         LEFT JOIN periods p ON c.id = p.client_id
         ORDER BY c.name, p.start_time
@@ -400,24 +340,16 @@ def list_hours():
     periods = c.fetchall()
     
     client_totals = {}
-    current_client = None
     
-    for client_name, period_id, start, end in periods:
+    for client_name, period_id, start, end, total_seconds in periods:
         if client_name not in client_totals:
             client_totals[client_name] = {'total': 0, 'periods': []}
         
         if period_id is None:
             continue
         
-        # Calculate hours for this period
-        c.execute("""
-            SELECT start_time, end_time FROM sessions
-            WHERE period_id = ? AND end_time IS NOT NULL
-            ORDER BY start_time
-        """, (period_id,))
-        
-        sessions = c.fetchall()
-        period_hours = sum(calculate_hours(s[0], s[1]) for s in sessions)
+        # Convert total_seconds to hours
+        period_hours = (total_seconds or 0) / 3600
         
         status = "Completed" if end else "Active"
         client_totals[client_name]['periods'].append({
@@ -447,9 +379,9 @@ def list_hours():
                 start_date = datetime.fromisoformat(period['start']).strftime('%Y-%m-%d %H:%M')
                 print(f"  Period #{period['id']} - {period['status']}")
                 print(f"    Started: {start_date}")
-                print(f"    Hours: {period['hours']:.2f}")
+                print(f"    Hours: {format_time(period['hours'])}")
         
-        print(f"\n  TOTAL: {data['total']:.2f} hours")
+        print(f"\n  TOTAL: {format_time(data['total'])}")
     print("="*60 + "\n")
 
 def parse_time_string(time_str):
@@ -488,7 +420,7 @@ def adjust_time(client_name, adjustment_hours, operation):
     client_id = client[0]
     
     # Get active period
-    c.execute("""SELECT id FROM periods 
+    c.execute("""SELECT id, total_seconds FROM periods 
                  WHERE client_id = ? AND end_time IS NULL""", (client_id,))
     period = c.fetchone()
     
@@ -497,71 +429,32 @@ def adjust_time(client_name, adjustment_hours, operation):
         conn.close()
         return
     
-    period_id = period[0]
+    period_id, current_total_seconds = period
+    current_total_seconds = current_total_seconds or 0
     
-    # Calculate current total hours
-    current_hours = get_period_total_hours(client_name)
+    # Calculate adjustment in seconds
+    adjustment_seconds = int(adjustment_hours * 3600)
     
     if operation == "subtract":
-        new_hours = max(0, current_hours - adjustment_hours)
-        adjustment_hours = current_hours - new_hours  # Actual adjustment made
+        new_total_seconds = max(0, current_total_seconds - adjustment_seconds)
+        actual_adjustment = current_total_seconds - new_total_seconds
     else:  # add
-        new_hours = current_hours + adjustment_hours
+        new_total_seconds = current_total_seconds + adjustment_seconds
+        actual_adjustment = adjustment_seconds
     
-    # Calculate the time difference in seconds
-    time_diff_seconds = int((new_hours - current_hours) * 3600)
-    
-    if time_diff_seconds == 0:
+    if actual_adjustment == 0:
         print(f"✓ No adjustment made (would result in negative time)")
         conn.close()
         return
     
-    # Create an adjustment session
-    now = datetime.now().isoformat()
-    start_time = datetime.now()
+    # Update the total_seconds directly
+    c.execute("UPDATE periods SET total_seconds = ? WHERE id = ?", (new_total_seconds, period_id))
     
-    if time_diff_seconds > 0:
-        # Add time: create a completed session with the duration
-        end_time = start_time
-        start_time = datetime.fromtimestamp(start_time.timestamp() - time_diff_seconds)
-        
-        c.execute("INSERT INTO sessions (period_id, start_time, end_time) VALUES (?, ?, ?)", 
-                  (period_id, start_time.isoformat(), end_time.isoformat()))
-        print(f"✓ Added {format_time(adjustment_hours)} to '{client_name}'")
+    actual_hours = actual_adjustment / 3600
+    if operation == "subtract":
+        print(f"✓ Subtracted {format_time(actual_hours)} from '{client_name}'")
     else:
-        # Subtract time: remove the most recent completed sessions
-        remaining_to_remove = abs(time_diff_seconds)
-        
-        c.execute("""
-            SELECT id, start_time, end_time FROM sessions
-            WHERE period_id = ? AND end_time IS NOT NULL
-            ORDER BY end_time DESC
-        """, (period_id,))
-        
-        sessions = c.fetchall()
-        
-        for session_id, start, end in sessions:
-            if remaining_to_remove <= 0:
-                break
-            
-            session_duration = int(calculate_hours(start, end) * 3600)
-            
-            if session_duration <= remaining_to_remove:
-                # Remove entire session
-                c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-                remaining_to_remove -= session_duration
-            else:
-                # Partially remove session by shortening it
-                new_duration = session_duration - remaining_to_remove
-                start_dt = datetime.fromisoformat(start)
-                new_end = start_dt.timestamp() + new_duration
-                new_end_iso = datetime.fromtimestamp(new_end).isoformat()
-                
-                c.execute("UPDATE sessions SET end_time = ? WHERE id = ?", 
-                          (new_end_iso, session_id))
-                remaining_to_remove = 0
-        
-        print(f"✓ Subtracted {format_time(adjustment_hours)} from '{client_name}'")
+        print(f"✓ Added {format_time(actual_hours)} to '{client_name}'")
     
     conn.commit()
     conn.close()
