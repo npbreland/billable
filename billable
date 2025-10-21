@@ -2,10 +2,72 @@
 import sqlite3
 import sys
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path.home() / '.billable_hours.db'
+
+def validate_client_name(name):
+    """Validate client name input"""
+    if not name:
+        raise ValueError("Client name cannot be empty")
+    
+    if not isinstance(name, str):
+        raise ValueError("Client name must be a string")
+    
+    name = name.strip()
+    if not name:
+        raise ValueError("Client name cannot be empty or only whitespace")
+    
+    if len(name) > 255:
+        raise ValueError("Client name cannot exceed 255 characters")
+    
+    # Check for potentially problematic characters
+    if any(char in name for char in ['\n', '\r', '\t']):
+        raise ValueError("Client name cannot contain newlines or tabs")
+    
+    # Check for SQL injection patterns (basic protection)
+    suspicious_patterns = [
+        r'[\'";]',  # Quote characters
+        r'--',      # SQL comments
+        r'/\*',     # Multi-line comments
+        r'\*/',
+    ]
+    
+    for pattern in suspicious_patterns:
+        if re.search(pattern, name, re.IGNORECASE):
+            raise ValueError("Client name contains invalid characters")
+    
+    return name
+
+def validate_command_args(command, args):
+    """Validate command line arguments"""
+    expected_args = {
+        'add': 1,
+        'start': 1,
+        'session': 1,
+        'end': 1,
+        'adjust': 3,  # client, flag, time
+        'clients': 0,
+        'list': 0,
+        'help': 0
+    }
+    
+    if command not in expected_args:
+        raise ValueError(f"Unknown command: {command}")
+    
+    expected_count = expected_args[command]
+    actual_count = len(args)
+    
+    if actual_count != expected_count:
+        if command == 'adjust':
+            raise ValueError(f"Command '{command}' requires {expected_count} arguments: <client> <--add|--subtract> <time>")
+        elif expected_count == 0:
+            if actual_count > 0:
+                raise ValueError(f"Command '{command}' takes no arguments")
+        else:
+            raise ValueError(f"Command '{command}' requires exactly {expected_count} argument(s)")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -21,15 +83,24 @@ def init_db():
     conn.close()
 
 def add_client(name):
+    try:
+        validated_name = validate_client_name(name)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO clients (name) VALUES (?)", (name,))
+        c.execute("INSERT INTO clients (name) VALUES (?)", (validated_name,))
         conn.commit()
-        print(f"✓ Client '{name}' added")
+        print(f"✓ Client '{validated_name}' added")
     except sqlite3.IntegrityError:
-        print(f"✗ Client '{name}' already exists")
-    conn.close()
+        print(f"✗ Client '{validated_name}' already exists")
+    except sqlite3.Error as e:
+        print(f"✗ Database error: {e}")
+    finally:
+        conn.close()
 
 def list_clients():
     conn = sqlite3.connect(DB_PATH)
@@ -48,33 +119,41 @@ def list_clients():
     print()
 
 def start_period(client_name):
+    try:
+        validated_name = validate_client_name(client_name)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
-    client = c.fetchone()
-    
-    if not client:
-        print(f"✗ Client '{client_name}' not found")
+    try:
+        c.execute("SELECT id FROM clients WHERE name = ?", (validated_name,))
+        client = c.fetchone()
+        
+        if not client:
+            print(f"✗ Client '{validated_name}' not found")
+            return
+        
+        client_id = client[0]
+        
+        # Check for active period
+        c.execute("""SELECT id FROM periods 
+                     WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+        if c.fetchone():
+            print(f"✗ Client '{validated_name}' already has an active billing period")
+            return
+        
+        now = datetime.now().isoformat()
+        c.execute("INSERT INTO periods (client_id, start_time) VALUES (?, ?)", 
+                  (client_id, now))
+        conn.commit()
+        print(f"✓ Started billing period for '{validated_name}'")
+    except sqlite3.Error as e:
+        print(f"✗ Database error: {e}")
+    finally:
         conn.close()
-        return
-    
-    client_id = client[0]
-    
-    # Check for active period
-    c.execute("""SELECT id FROM periods 
-                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
-    if c.fetchone():
-        print(f"✗ Client '{client_name}' already has an active billing period")
-        conn.close()
-        return
-    
-    now = datetime.now().isoformat()
-    c.execute("INSERT INTO periods (client_id, start_time) VALUES (?, ?)", 
-              (client_id, now))
-    conn.commit()
-    print(f"✓ Started billing period for '{client_name}'")
-    conn.close()
 
 
 def format_time(hours):
@@ -87,62 +166,77 @@ def format_time(hours):
 
 def get_period_total_hours(client_name):
     """Calculate total hours for the active period"""
+    try:
+        validated_name = validate_client_name(client_name)
+    except ValueError:
+        return 0
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
-    client = c.fetchone()
-    
-    if not client:
-        conn.close()
+    try:
+        c.execute("SELECT id FROM clients WHERE name = ?", (validated_name,))
+        client = c.fetchone()
+        
+        if not client:
+            return 0
+        
+        client_id = client[0]
+        
+        # Get active period
+        c.execute("""SELECT total_seconds FROM periods 
+                     WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+        period = c.fetchone()
+        
+        if not period:
+            return 0
+        
+        total_hours = (period[0] or 0) / 3600
+        return total_hours
+    except sqlite3.Error:
         return 0
-    
-    client_id = client[0]
-    
-    # Get active period
-    c.execute("""SELECT total_seconds FROM periods 
-                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
-    period = c.fetchone()
-    
-    if not period:
+    finally:
         conn.close()
-        return 0
-    
-    total_hours = period[0] / 3600
-    
-    conn.close()
-    return total_hours
 
 # display_status function removed - now handled within toggle_session
 
 def toggle_session(client_name):
     """Interactive toggle mode - press enter to toggle, Ctrl+D to exit"""
+    try:
+        validated_name = validate_client_name(client_name)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
-    client = c.fetchone()
-    
-    if not client:
-        print(f"✗ Client '{client_name}' not found")
-        conn.close()
+    try:
+        c.execute("SELECT id FROM clients WHERE name = ?", (validated_name,))
+        client = c.fetchone()
+        
+        if not client:
+            print(f"✗ Client '{validated_name}' not found")
+            return
+        
+        client_id = client[0]
+        
+        # Get or check active period
+        c.execute("""SELECT id FROM periods 
+                     WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+        period = c.fetchone()
+        
+        if not period:
+            print(f"✗ No active billing period for '{validated_name}'")
+            print(f"Start one with: billable start \"{validated_name}\"")
+            return
+        
+        period_id = period[0]
+    except sqlite3.Error as e:
+        print(f"✗ Database error: {e}")
         return
-    
-    client_id = client[0]
-    
-    # Get or check active period
-    c.execute("""SELECT id FROM periods 
-                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
-    period = c.fetchone()
-    
-    if not period:
-        print(f"✗ No active billing period for '{client_name}'")
-        print(f"Start one with: billable start \"{client_name}\"")
+    finally:
         conn.close()
-        return
-    
-    period_id = period[0]
-    conn.close()
     
     # Local session state for this interactive session
     session_running = False
@@ -157,7 +251,7 @@ def toggle_session(client_name):
     
     def display_session_status():
         """Display the timer UI with local session state"""
-        total_hours = get_period_total_hours(client_name)
+        total_hours = get_period_total_hours(validated_name)
         
         # Add current session time if running
         if session_running and session_start_time:
@@ -167,7 +261,7 @@ def toggle_session(client_name):
         # Clear screen and show header
         print("\033[2J\033[H")  # Clear screen and move cursor to top
         print("="*60)
-        print(f"  Billable Timer: {client_name}")
+        print(f"  Billable Timer: {validated_name}")
         print("="*60)
         print("\n  Controls:")
         print("    [ENTER]  - Play/Pause timer")
@@ -282,37 +376,45 @@ def toggle_session(client_name):
         fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
 
 def end_period(client_name):
+    try:
+        validated_name = validate_client_name(client_name)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
-    client = c.fetchone()
-    
-    if not client:
-        print(f"✗ Client '{client_name}' not found")
+    try:
+        c.execute("SELECT id FROM clients WHERE name = ?", (validated_name,))
+        client = c.fetchone()
+        
+        if not client:
+            print(f"✗ Client '{validated_name}' not found")
+            return
+        
+        client_id = client[0]
+        
+        # Get active period
+        c.execute("""SELECT id FROM periods 
+                     WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+        period = c.fetchone()
+        
+        if not period:
+            print(f"✗ No active billing period for '{validated_name}'")
+            return
+        
+        period_id = period[0]
+        
+        # End the period
+        now = datetime.now().isoformat()
+        c.execute("UPDATE periods SET end_time = ? WHERE id = ?", (now, period_id))
+        conn.commit()
+        print(f"✓ Ended billing period for '{validated_name}'")
+    except sqlite3.Error as e:
+        print(f"✗ Database error: {e}")
+    finally:
         conn.close()
-        return
-    
-    client_id = client[0]
-    
-    # Get active period
-    c.execute("""SELECT id FROM periods 
-                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
-    period = c.fetchone()
-    
-    if not period:
-        print(f"✗ No active billing period for '{client_name}'")
-        conn.close()
-        return
-    
-    period_id = period[0]
-    
-    # End the period
-    now = datetime.now().isoformat()
-    c.execute("UPDATE periods SET end_time = ? WHERE id = ?", (now, period_id))
-    conn.commit()
-    print(f"✓ Ended billing period for '{client_name}'")
-    conn.close()
 
 def list_hours():
     conn = sqlite3.connect(DB_PATH)
@@ -374,9 +476,25 @@ def list_hours():
 
 def parse_time_string(time_str):
     """Parse time string in H:MM or HH:MM format to hours"""
+    if not time_str or not isinstance(time_str, str):
+        raise ValueError("Time must be a non-empty string")
+    
+    time_str = time_str.strip()
+    if not time_str:
+        raise ValueError("Time cannot be empty or only whitespace")
+    
+    # Check for potentially malicious input
+    if any(char in time_str for char in [';', '&', '|', '`', '$', '<', '>', '"', "'"]):
+        raise ValueError("Time contains invalid characters")
+    
     try:
         if ':' not in time_str:
-            return float(time_str)
+            hours = float(time_str)
+            if hours < 0:
+                raise ValueError("Time cannot be negative")
+            if hours > 24:
+                raise ValueError("Time cannot exceed 24 hours")
+            return hours
         
         parts = time_str.split(':')
         if len(parts) != 2:
@@ -385,67 +503,88 @@ def parse_time_string(time_str):
         hours = int(parts[0])
         minutes = int(parts[1])
         
+        if hours < 0:
+            raise ValueError("Hours cannot be negative")
+        if hours > 23:
+            raise ValueError("Hours cannot exceed 23")
         if minutes < 0 or minutes > 59:
             raise ValueError("Minutes must be between 0 and 59")
         
         return hours + (minutes / 60.0)
-    except (ValueError, IndexError):
-        raise ValueError("Invalid time format. Use H:MM or HH:MM")
+    except (ValueError, IndexError) as e:
+        if "invalid literal" in str(e):
+            raise ValueError("Invalid time format. Use H:MM or HH:MM")
+        raise
 
 def adjust_time(client_name, adjustment_hours, operation):
     """Add or subtract time from the active period"""
+    try:
+        validated_name = validate_client_name(client_name)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return
+    
+    if operation not in ["add", "subtract"]:
+        print(f"✗ Invalid operation: {operation}")
+        return
+    
+    if not isinstance(adjustment_hours, (int, float)) or adjustment_hours < 0:
+        print(f"✗ Invalid adjustment hours: {adjustment_hours}")
+        return
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
-    client = c.fetchone()
-    
-    if not client:
-        print(f"✗ Client '{client_name}' not found")
+    try:
+        c.execute("SELECT id FROM clients WHERE name = ?", (validated_name,))
+        client = c.fetchone()
+        
+        if not client:
+            print(f"✗ Client '{validated_name}' not found")
+            return
+        
+        client_id = client[0]
+        
+        # Get active period
+        c.execute("""SELECT id, total_seconds FROM periods 
+                     WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+        period = c.fetchone()
+        
+        if not period:
+            print(f"✗ No active billing period for '{validated_name}'")
+            return
+        
+        period_id, current_total_seconds = period
+        current_total_seconds = current_total_seconds or 0
+        
+        # Calculate adjustment in seconds
+        adjustment_seconds = int(adjustment_hours * 3600)
+        
+        if operation == "subtract":
+            new_total_seconds = max(0, current_total_seconds - adjustment_seconds)
+            actual_adjustment = current_total_seconds - new_total_seconds
+        else:  # add
+            new_total_seconds = current_total_seconds + adjustment_seconds
+            actual_adjustment = adjustment_seconds
+        
+        if actual_adjustment == 0:
+            print(f"✓ No adjustment made (would result in negative time)")
+            return
+        
+        # Update the total_seconds directly
+        c.execute("UPDATE periods SET total_seconds = ? WHERE id = ?", (new_total_seconds, period_id))
+        
+        actual_hours = actual_adjustment / 3600
+        if operation == "subtract":
+            print(f"✓ Subtracted {format_time(actual_hours)} from '{validated_name}'")
+        else:
+            print(f"✓ Added {format_time(actual_hours)} to '{validated_name}'")
+        
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"✗ Database error: {e}")
+    finally:
         conn.close()
-        return
-    
-    client_id = client[0]
-    
-    # Get active period
-    c.execute("""SELECT id, total_seconds FROM periods 
-                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
-    period = c.fetchone()
-    
-    if not period:
-        print(f"✗ No active billing period for '{client_name}'")
-        conn.close()
-        return
-    
-    period_id, current_total_seconds = period
-    current_total_seconds = current_total_seconds or 0
-    
-    # Calculate adjustment in seconds
-    adjustment_seconds = int(adjustment_hours * 3600)
-    
-    if operation == "subtract":
-        new_total_seconds = max(0, current_total_seconds - adjustment_seconds)
-        actual_adjustment = current_total_seconds - new_total_seconds
-    else:  # add
-        new_total_seconds = current_total_seconds + adjustment_seconds
-        actual_adjustment = adjustment_seconds
-    
-    if actual_adjustment == 0:
-        print(f"✓ No adjustment made (would result in negative time)")
-        conn.close()
-        return
-    
-    # Update the total_seconds directly
-    c.execute("UPDATE periods SET total_seconds = ? WHERE id = ?", (new_total_seconds, period_id))
-    
-    actual_hours = actual_adjustment / 3600
-    if operation == "subtract":
-        print(f"✓ Subtracted {format_time(actual_hours)} from '{client_name}'")
-    else:
-        print(f"✓ Added {format_time(actual_hours)} to '{client_name}'")
-    
-    conn.commit()
-    conn.close()
 
 def show_usage():
     print("""
@@ -473,49 +612,69 @@ Quick workflow:
 """)
 
 def main():
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        print(f"✗ Failed to initialize database: {e}")
+        return
     
     if len(sys.argv) < 2:
         show_usage()
         return
     
     command = sys.argv[1].lower()
+    args = sys.argv[2:]
     
-    if command == 'add' and len(sys.argv) == 3:
-        add_client(sys.argv[2])
-    elif command == 'clients':
-        list_clients()
-    elif command == 'start' and len(sys.argv) == 3:
-        start_period(sys.argv[2])
-    elif command == 'session' and len(sys.argv) == 3:
-        toggle_session(sys.argv[2])
-    elif command == 'adjust' and len(sys.argv) == 5:
-        client_name = sys.argv[2]
-        operation_flag = sys.argv[3]
-        time_str = sys.argv[4]
-        
-        if operation_flag == '--add':
-            operation = 'add'
-        elif operation_flag == '--subtract':
-            operation = 'subtract'
-        else:
-            print("✗ Invalid flag. Use --add or --subtract")
+    # Validate command and arguments
+    try:
+        validate_command_args(command, args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        show_usage()
+        return
+    
+    # Execute commands
+    try:
+        if command == 'add':
+            add_client(args[0])
+        elif command == 'clients':
+            list_clients()
+        elif command == 'start':
+            start_period(args[0])
+        elif command == 'session':
+            toggle_session(args[0])
+        elif command == 'adjust':
+            client_name = args[0]
+            operation_flag = args[1]
+            time_str = args[2]
+            
+            if operation_flag == '--add':
+                operation = 'add'
+            elif operation_flag == '--subtract':
+                operation = 'subtract'
+            else:
+                print("✗ Invalid flag. Use --add or --subtract")
+                show_usage()
+                return
+            
+            try:
+                adjustment_hours = parse_time_string(time_str)
+                adjust_time(client_name, adjustment_hours, operation)
+            except ValueError as e:
+                print(f"✗ {e}")
+        elif command == 'end':
+            end_period(args[0])
+        elif command == 'list':
+            list_hours()
+        elif command == 'help':
             show_usage()
-            return
-        
-        try:
-            adjustment_hours = parse_time_string(time_str)
-            adjust_time(client_name, adjustment_hours, operation)
-        except ValueError as e:
-            print(f"✗ {e}")
-    elif command == 'end' and len(sys.argv) == 3:
-        end_period(sys.argv[2])
-    elif command == 'list':
-        list_hours()
-    elif command == 'help':
-        show_usage()
-    else:
-        show_usage()
+    except KeyboardInterrupt:
+        print("\n✓ Operation cancelled")
+    except Exception as e:
+        print(f"✗ Unexpected error: {e}")
+        if "--debug" in sys.argv:
+            import traceback
+            traceback.print_exc()
 
 if __name__ == '__main__':
     main()
