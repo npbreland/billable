@@ -4,8 +4,6 @@ import sys
 import os
 from datetime import datetime
 from pathlib import Path
-import tty
-import termios
 
 DB_PATH = Path.home() / '.billable_hours.db'
 
@@ -78,16 +76,6 @@ def start_period(client_name):
     print(f"✓ Started billing period for '{client_name}'")
     conn.close()
 
-def getch():
-    """Get a single character from stdin"""
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
 
 def format_time(hours):
     """Format hours as HH:MM:SS"""
