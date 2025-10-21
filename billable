@@ -575,8 +575,8 @@ Usage:
   billable clients               List all clients
   billable start <client>        Start a billing period for a client
   billable session <client>       Open interactive timer (ENTER=play/pause, CTRL+D=exit)
-  billable time <client> --add <time>     Add time to active period (e.g. 1:30 for 1hr 30min)
-  billable time <client> --subtract <time> Subtract time from active period
+  billable adjust <client> --add <time>     Add time to active period (e.g. 1:30 for 1hr 30min)
+  billable adjust <client> --subtract <time> Subtract time from active period
   billable end <client>          End the billing period
   billable list                  Show hours for all clients
   billable help                  Show this help message
@@ -608,7 +608,7 @@ def main():
         start_period(sys.argv[2])
     elif command == 'session' and len(sys.argv) == 3:
         toggle_session(sys.argv[2])
-    elif command == 'time' and len(sys.argv) == 5:
+    elif command == 'adjust' and len(sys.argv) == 5:
         client_name = sys.argv[2]
         operation_flag = sys.argv[3]
         time_str = sys.argv[4]
