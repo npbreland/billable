@@ -2,6 +2,7 @@
 
 **NOTE:** I built this with like 80% vibe coding and there are no tests. There is some input validation, but please don't use this in a client production environment.
 
+You'll need to make the file `billable` executable (e.g. `chmod +x billable`) and add it to your PATH or link it to a file in one of your path directories (e.g. /home/user/.local/bin).
 
 A lightweight Linux command-line tool for tracking billable hours across multiple clients. Built in Python with SQLite for persistent storage.
 
