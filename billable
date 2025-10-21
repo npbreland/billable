@@ -4,6 +4,8 @@ import sys
 import os
 from datetime import datetime
 from pathlib import Path
+import tty
+import termios
 
 DB_PATH = Path.home() / '.billable_hours.db'
 
@@ -79,7 +81,8 @@ def start_period(client_name):
     print(f"✓ Started billing period for '{client_name}'")
     conn.close()
 
-def toggle_session(client_name):
+def toggle_session_internal(client_name):
+    """Internal function to toggle session state"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
@@ -87,9 +90,8 @@ def toggle_session(client_name):
     client = c.fetchone()
     
     if not client:
-        print(f"✗ Client '{client_name}' not found")
         conn.close()
-        return
+        return None
     
     client_id = client[0]
     
@@ -99,9 +101,8 @@ def toggle_session(client_name):
     period = c.fetchone()
     
     if not period:
-        print(f"✗ No active billing period for '{client_name}'")
         conn.close()
-        return
+        return None
     
     period_id = period[0]
     
@@ -117,15 +118,231 @@ def toggle_session(client_name):
         c.execute("UPDATE sessions SET end_time = ? WHERE id = ?", 
                   (now, active_session[0]))
         conn.commit()
-        print(f"⏸  Paused timer for '{client_name}'")
+        conn.close()
+        return "paused"
     else:
         # Start - create new session
         c.execute("INSERT INTO sessions (period_id, start_time) VALUES (?, ?)", 
                   (period_id, now))
         conn.commit()
-        print(f"▶  Started timer for '{client_name}'")
+        conn.close()
+        return "running"
+
+def get_session_state(client_name):
+    """Check if timer is currently running"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
+    client = c.fetchone()
+    
+    if not client:
+        conn.close()
+        return None
+    
+    client_id = client[0]
+    
+    # Get active period
+    c.execute("""SELECT id FROM periods 
+                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+    period = c.fetchone()
+    
+    if not period:
+        conn.close()
+        return None
+    
+    period_id = period[0]
+    
+    # Check for active session
+    c.execute("""SELECT id FROM sessions 
+                 WHERE period_id = ? AND end_time IS NULL""", (period_id,))
+    active_session = c.fetchone()
+    conn.close()
+    
+    return "running" if active_session else "paused"
+
+def getch():
+    """Get a single character from stdin"""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
+
+def format_time(hours):
+    """Format hours as HH:MM:SS"""
+    total_seconds = int(hours * 3600)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def get_period_total_hours(client_name):
+    """Calculate total hours for the active period"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
+    client = c.fetchone()
+    
+    if not client:
+        conn.close()
+        return 0
+    
+    client_id = client[0]
+    
+    # Get active period
+    c.execute("""SELECT id FROM periods 
+                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+    period = c.fetchone()
+    
+    if not period:
+        conn.close()
+        return 0
+    
+    period_id = period[0]
+    
+    # Calculate hours from completed sessions
+    c.execute("""
+        SELECT start_time, end_time FROM sessions
+        WHERE period_id = ? AND end_time IS NOT NULL
+        ORDER BY start_time
+    """, (period_id,))
+    
+    sessions = c.fetchall()
+    total_hours = sum(calculate_hours(s[0], s[1]) for s in sessions)
+    
+    # Add current running session if any
+    c.execute("""
+        SELECT start_time FROM sessions
+        WHERE period_id = ? AND end_time IS NULL
+    """, (period_id,))
+    
+    running_session = c.fetchone()
+    if running_session:
+        total_hours += calculate_hours(running_session[0], datetime.now().isoformat())
     
     conn.close()
+    return total_hours
+
+def display_status(client_name):
+    """Display the timer UI"""
+    state = get_session_state(client_name)
+    total_hours = get_period_total_hours(client_name)
+    
+    # Clear screen and show header
+    print("\033[2J\033[H")  # Clear screen and move cursor to top
+    print("="*60)
+    print(f"  Billable Timer: {client_name}")
+    print("="*60)
+    print("\n  Controls:")
+    print("    [ENTER]  - Play/Pause timer")
+    print("    [CTRL+D] - End session and exit")
+    print("\n" + "-"*60 + "\n")
+    
+    if state == "running":
+        print("  Status: ▶  RUNNING")
+    else:
+        print("  Status: ⏸  PAUSED")
+    
+    print(f"\n  Total Time: {format_time(total_hours)}")
+    
+    print("\n" + "-"*60)
+    print("\nPress ENTER to play/pause...")
+
+def toggle_session(client_name):
+    """Interactive toggle mode - press enter to toggle, Ctrl+D to exit"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
+    client = c.fetchone()
+    
+    if not client:
+        print(f"✗ Client '{client_name}' not found")
+        conn.close()
+        return
+    
+    client_id = client[0]
+    
+    # Get or check active period
+    c.execute("""SELECT id FROM periods 
+                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+    period = c.fetchone()
+    
+    if not period:
+        print(f"✗ No active billing period for '{client_name}'")
+        print(f"Start one with: billable start \"{client_name}\"")
+        conn.close()
+        return
+    
+    conn.close()
+    
+    # Set stdin to non-blocking for running state
+    import fcntl
+    import time
+    
+    fd = sys.stdin.fileno()
+    old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    
+    # Initial display
+    display_status(client_name)
+    
+    try:
+        last_update = time.time()
+        
+        while True:
+            state = get_session_state(client_name)
+            
+            if state == "running":
+                # Non-blocking mode when running
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+                
+                try:
+                    line = sys.stdin.readline()
+                    if line:
+                        # Toggle on enter
+                        toggle_session_internal(client_name)
+                        display_status(client_name)
+                        last_update = time.time()
+                except IOError:
+                    # No input available
+                    pass
+                
+                # Update display every second
+                current_time = time.time()
+                if current_time - last_update >= 1:
+                    display_status(client_name)
+                    last_update = current_time
+                
+                time.sleep(0.1)  # Small sleep to prevent busy waiting
+                
+            else:
+                # Blocking mode when paused
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+                
+                try:
+                    line = sys.stdin.readline()
+                    if line:
+                        toggle_session_internal(client_name)
+                        display_status(client_name)
+                        last_update = time.time()
+                    else:
+                        # EOF (Ctrl+D)
+                        print("\n\n✓ Session ended\n")
+                        break
+                except EOFError:
+                    print("\n\n✓ Session ended\n")
+                    break
+                
+    except KeyboardInterrupt:
+        print("\n\n✓ Session ended\n")
+    finally:
+        # Restore original flags
+        fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
 
 def end_period(client_name):
     conn = sqlite3.connect(DB_PATH)
@@ -243,7 +460,7 @@ Usage:
   billable add <client>          Add a new client
   billable clients               List all clients
   billable start <client>        Start a billing period for a client
-  billable toggle <client>       Start/pause timer (press Enter)
+  billable session <client>       Open interactive timer (ENTER=play/pause, CTRL+D=exit)
   billable end <client>          End the billing period
   billable list                  Show hours for all clients
   billable help                  Show this help message
@@ -251,11 +468,11 @@ Usage:
 Quick workflow:
   1. billable add "Acme Corp"
   2. billable start "Acme Corp"
-  3. billable toggle "Acme Corp"  # Start timer
-  4. billable toggle "Acme Corp"  # Pause timer
-  5. billable toggle "Acme Corp"  # Resume timer
-  6. billable end "Acme Corp"
-  7. billable list
+  3. billable session "Acme Corp"
+     - Press ENTER to start/pause timer
+     - Press CTRL+D to exit and pause
+  4. billable end "Acme Corp"
+  5. billable list
 """)
 
 def main():
@@ -273,7 +490,7 @@ def main():
         list_clients()
     elif command == 'start' and len(sys.argv) == 3:
         start_period(sys.argv[2])
-    elif command == 'toggle' and len(sys.argv) == 3:
+    elif command == 'session' and len(sys.argv) == 3:
         toggle_session(sys.argv[2])
     elif command == 'end' and len(sys.argv) == 3:
         end_period(sys.argv[2])
