@@ -452,6 +452,120 @@ def list_hours():
         print(f"\n  TOTAL: {data['total']:.2f} hours")
     print("="*60 + "\n")
 
+def parse_time_string(time_str):
+    """Parse time string in H:MM or HH:MM format to hours"""
+    try:
+        if ':' not in time_str:
+            return float(time_str)
+        
+        parts = time_str.split(':')
+        if len(parts) != 2:
+            raise ValueError("Invalid time format")
+        
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        
+        if minutes < 0 or minutes > 59:
+            raise ValueError("Minutes must be between 0 and 59")
+        
+        return hours + (minutes / 60.0)
+    except (ValueError, IndexError):
+        raise ValueError("Invalid time format. Use H:MM or HH:MM")
+
+def adjust_time(client_name, adjustment_hours, operation):
+    """Add or subtract time from the active period"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT id FROM clients WHERE name = ?", (client_name,))
+    client = c.fetchone()
+    
+    if not client:
+        print(f"✗ Client '{client_name}' not found")
+        conn.close()
+        return
+    
+    client_id = client[0]
+    
+    # Get active period
+    c.execute("""SELECT id FROM periods 
+                 WHERE client_id = ? AND end_time IS NULL""", (client_id,))
+    period = c.fetchone()
+    
+    if not period:
+        print(f"✗ No active billing period for '{client_name}'")
+        conn.close()
+        return
+    
+    period_id = period[0]
+    
+    # Calculate current total hours
+    current_hours = get_period_total_hours(client_name)
+    
+    if operation == "subtract":
+        new_hours = max(0, current_hours - adjustment_hours)
+        adjustment_hours = current_hours - new_hours  # Actual adjustment made
+    else:  # add
+        new_hours = current_hours + adjustment_hours
+    
+    # Calculate the time difference in seconds
+    time_diff_seconds = int((new_hours - current_hours) * 3600)
+    
+    if time_diff_seconds == 0:
+        print(f"✓ No adjustment made (would result in negative time)")
+        conn.close()
+        return
+    
+    # Create an adjustment session
+    now = datetime.now().isoformat()
+    start_time = datetime.now()
+    
+    if time_diff_seconds > 0:
+        # Add time: create a completed session with the duration
+        end_time = start_time
+        start_time = datetime.fromtimestamp(start_time.timestamp() - time_diff_seconds)
+        
+        c.execute("INSERT INTO sessions (period_id, start_time, end_time) VALUES (?, ?, ?)", 
+                  (period_id, start_time.isoformat(), end_time.isoformat()))
+        print(f"✓ Added {format_time(adjustment_hours)} to '{client_name}'")
+    else:
+        # Subtract time: remove the most recent completed sessions
+        remaining_to_remove = abs(time_diff_seconds)
+        
+        c.execute("""
+            SELECT id, start_time, end_time FROM sessions
+            WHERE period_id = ? AND end_time IS NOT NULL
+            ORDER BY end_time DESC
+        """, (period_id,))
+        
+        sessions = c.fetchall()
+        
+        for session_id, start, end in sessions:
+            if remaining_to_remove <= 0:
+                break
+            
+            session_duration = int(calculate_hours(start, end) * 3600)
+            
+            if session_duration <= remaining_to_remove:
+                # Remove entire session
+                c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                remaining_to_remove -= session_duration
+            else:
+                # Partially remove session by shortening it
+                new_duration = session_duration - remaining_to_remove
+                start_dt = datetime.fromisoformat(start)
+                new_end = start_dt.timestamp() + new_duration
+                new_end_iso = datetime.fromtimestamp(new_end).isoformat()
+                
+                c.execute("UPDATE sessions SET end_time = ? WHERE id = ?", 
+                          (new_end_iso, session_id))
+                remaining_to_remove = 0
+        
+        print(f"✓ Subtracted {format_time(adjustment_hours)} from '{client_name}'")
+    
+    conn.commit()
+    conn.close()
+
 def show_usage():
     print("""
 Billable Hours Tracker
@@ -461,6 +575,8 @@ Usage:
   billable clients               List all clients
   billable start <client>        Start a billing period for a client
   billable session <client>       Open interactive timer (ENTER=play/pause, CTRL+D=exit)
+  billable time <client> --add <time>     Add time to active period (e.g. 1:30 for 1hr 30min)
+  billable time <client> --subtract <time> Subtract time from active period
   billable end <client>          End the billing period
   billable list                  Show hours for all clients
   billable help                  Show this help message
@@ -492,6 +608,25 @@ def main():
         start_period(sys.argv[2])
     elif command == 'session' and len(sys.argv) == 3:
         toggle_session(sys.argv[2])
+    elif command == 'time' and len(sys.argv) == 5:
+        client_name = sys.argv[2]
+        operation_flag = sys.argv[3]
+        time_str = sys.argv[4]
+        
+        if operation_flag == '--add':
+            operation = 'add'
+        elif operation_flag == '--subtract':
+            operation = 'subtract'
+        else:
+            print("✗ Invalid flag. Use --add or --subtract")
+            show_usage()
+            return
+        
+        try:
+            adjustment_hours = parse_time_string(time_str)
+            adjust_time(client_name, adjustment_hours, operation)
+        except ValueError as e:
+            print(f"✗ {e}")
     elif command == 'end' and len(sys.argv) == 3:
         end_period(sys.argv[2])
     elif command == 'list':
